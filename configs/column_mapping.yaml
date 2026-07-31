@@ -1,0 +1,13 @@
+version: "1.0"
+columns:
+  sender: sender
+  receiver: receiver
+  date: date
+  subject: subject
+  body: body
+  label: label
+  urls: urls
+labels:
+  "1": phishing
+  "0": legitimate
+

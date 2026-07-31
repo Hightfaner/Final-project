@@ -1,0 +1,48 @@
+dataset_path: data/raw/Nazario_5.csv
+output_root: data
+reports_root: reports
+log_path: logs/pipeline.jsonl
+
+dataset:
+  expected_raw_rows: 3065
+  expected_eligible_rows: 3063
+  encoding: utf-8-sig
+  require_read_only: true
+
+split:
+  train_ratio: 0.70
+  validation_ratio: 0.15
+  test_ratio: 0.15
+  expected_counts:
+    train: 2144
+    validation: 460
+    test: 459
+  seed: 42
+  max_ratio_deviation: 0.02
+  max_class_ratio_deviation: 0.03
+
+template_grouping:
+  exact_signature: true
+  near_similarity_enabled: true
+  cosine_threshold: 0.95
+  char_ngram_range: [3, 5]
+  min_df: 2
+  max_features: 100000
+  max_group_size: 250
+
+duplicates:
+  policy: keep_all_grouped
+
+sanitisation:
+  version: "1.0"
+  preserve_case: true
+  preserve_exclamation_marks: true
+  render_urls_as_static_markers: true
+
+feature_config: configs/feature_contract.json
+keyword_config: configs/keywords.json
+column_mapping: configs/column_mapping.yaml
+
+output:
+  refuse_final_overwrite: true
+

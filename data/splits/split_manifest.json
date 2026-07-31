@@ -1,0 +1,90 @@
+{
+  "artifact_sha256": {
+    "data/interim/duplicate_groups.csv": "8ade205b36ba34460f0ad469e387620c3ff62329a4f0a761c25c7b4d53e70622",
+    "data/interim/exclusions.csv": "709fe82ff1f3f356b030952e364de8b9822e751859c532afa775e8fe804c8d07",
+    "data/interim/nazario_5_sanitised.csv": "86671db7a2d19ce1a09b065d6dad078e212fd0987a9841b938a03885745a82c4",
+    "data/interim/template_groups.csv": "95db58a3fc0c4786b8334649cac73d252678eebf346ca36f95f858a59724e407",
+    "data/interim/template_similarity_pairs.csv": "500dd085056dbc2f4ffdbb7c50afe4914cca6c9cd01b77347e543d4b6cbc66ab",
+    "data/processed/feature_matrix_all.csv": "e2d8517230151c2fd40afa39b58aecc8e597c89d6ad143673de166db18d44866",
+    "data/processed/feature_matrix_test.csv": "ea1b8737c77a2f03574457f8d4c3f8e7fe947cf9e01867ee6ccf0173d5233bad",
+    "data/processed/feature_matrix_train.csv": "a9a55f1cf690c881673eaa8dab82c4b6c382ea9308ca3f31be2de9b70ffb77ba",
+    "data/processed/feature_matrix_validation.csv": "64688aec1c3918f15fd622c972e989094fe63774d537b38f2f4c33df3c684768",
+    "data/splits/test_ids.csv": "bb335dbe7c66fde3bf4cf67f88ef007fe81df0f3acf43db327fa18d3b7867d1e",
+    "data/splits/train_ids.csv": "642faee7b9c1ffa35b4875659b00e585e72a42083290dca15bd113196d791a4f",
+    "data/splits/validation_ids.csv": "0b34bd8e4d4798697e6c6c3f3016112fe129d535b36cc28680dea3472899ba8e"
+  },
+  "code_revision": "uncommitted-initial-implementation",
+  "config_hashes": {
+    "column_mapping.yaml": "1d12077ed8b58bfb055ffae32697a6c2d762d70721f05ff38b20578bccecd5be",
+    "feature_contract.json": "8dc9ee6b90eb8eaedc2963118c488149a8772f3e8dc22a543f65bd6086413a6a",
+    "keywords.json": "79f7f197bc9b99dbe1429b00ebd53062403778195d8f6d78fd0f8df1a35b132e",
+    "pipeline.yaml": "766ec5f8b61b8f8c39b720454e1b5b35bc95439e0deaea4fc29ea3c08c7384d4"
+  },
+  "created_utc": "2026-07-31T21:11:57.141637+00:00",
+  "dataset_md5": "45db8330ea4aabbf72f5199949ae03e5",
+  "dataset_path": "data/raw/Nazario_5.csv",
+  "dataset_rows": 3065,
+  "dataset_sha256": "afef69828165619ced6661ca14a95444a1db82c7b25ae9c2619bbbb108844a44",
+  "duplicate_summary": {
+    "mixed_label_sanitised_duplicate_groups": 0,
+    "near_similarity_pair_count": 1078,
+    "policy": "keep_all_grouped",
+    "raw_exact_duplicate_groups": 0,
+    "raw_exact_duplicate_records": 0,
+    "sanitised_exact_duplicate_groups": 15,
+    "sanitised_exact_duplicate_records": 31,
+    "template_group_count": 2726
+  },
+  "eligible_rows": 3063,
+  "excluded_rows": 2,
+  "feature_contract_version": "1.0",
+  "keywords_frozen_date": "2026-07-30",
+  "keywords_status": "frozen",
+  "keywords_version": "1.0",
+  "manifest_version": "1.0",
+  "research_boundary": {
+    "explanations_generated": false,
+    "model_training": false,
+    "stimuli_selected": false,
+    "test_model_performance": false
+  },
+  "sanitisation_version": "1.0",
+  "seed": 42,
+  "split_summary": {
+    "actual_counts": {
+      "test": 459,
+      "train": 2144,
+      "validation": 460
+    },
+    "actual_phishing_counts": {
+      "test": 234,
+      "train": 1094,
+      "validation": 235
+    },
+    "cross_split_template_group_violations": 0,
+    "overall_phishing_ratio": 0.5102840352595495,
+    "seed": 42,
+    "split_phishing_ratios": {
+      "test": 0.5098039215686274,
+      "train": 0.5102611940298507,
+      "validation": 0.5108695652173914
+    },
+    "target_counts": {
+      "test": 459,
+      "train": 2144,
+      "validation": 460
+    },
+    "target_phishing_counts": {
+      "test": 234,
+      "train": 1094,
+      "validation": 235
+    },
+    "template_group_count": 2726
+  },
+  "target_ratios": {
+    "test": 0.15,
+    "train": 0.7,
+    "validation": 0.15
+  },
+  "template_grouping_version": "1.0"
+}
