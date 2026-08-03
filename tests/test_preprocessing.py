@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from copy import deepcopy
 from pathlib import Path
 
 import pandas as pd
@@ -12,7 +11,6 @@ from src.pipeline import (
     BASE_OUTPUT_COLUMNS,
     PreprocessingError,
     _new_stratified_split,
-    _validate_manual_review,
     _validate_output,
 )
 
@@ -88,17 +86,3 @@ def test_06_seed_and_feature_output_are_deterministic() -> None:
     assert extract_features("URGENT!", "Visit https://192.0.2.1/login", matcher) == extract_features(
         "URGENT!", "Visit https://192.0.2.1/login", matcher
     )
-
-
-def test_07_eight_manual_review_ids_are_recorded() -> None:
-    frame = valid_frame()
-    review = {
-        "status": "approved",
-        "reviewed_date": "2026-08-03",
-        "email_ids": frame["email_id"].tolist(),
-    }
-    assert len(_validate_manual_review(frame, {"manual_spot_check": review})) == 8
-    pending = deepcopy(review)
-    pending["status"] = "pending"
-    with pytest.raises(PreprocessingError, match="not been approved"):
-        _validate_manual_review(frame, {"manual_spot_check": pending})

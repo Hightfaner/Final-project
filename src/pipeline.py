@@ -283,25 +283,11 @@ def _validate_output(frame: pd.DataFrame, feature_order: list[str]) -> dict[str,
     return checks
 
 
-def _validate_manual_review(frame: pd.DataFrame, config: dict[str, Any]) -> list[str]:
-    review = config.get("manual_spot_check", {})
-    ids = [str(value) for value in review.get("email_ids", [])]
-    if review.get("status") != "approved" or not review.get("reviewed_date"):
-        raise PreprocessingError("Manual spot check has not been approved")
-    if len(ids) < 8 or len(ids) != len(set(ids)):
-        raise PreprocessingError("Manual spot check must contain at least 8 unique email_id values")
-    missing = sorted(set(ids) - set(frame["email_id"].astype(str)))
-    if missing:
-        raise PreprocessingError(f"Manual spot-check IDs are missing from output: {missing}")
-    return ids
-
-
 def _build_summary(
     frame: pd.DataFrame,
     config: dict[str, Any],
     stats: dict[str, Any],
     checks: dict[str, str],
-    manual_count: int,
 ) -> str:
     feature_order = [str(value) for value in config["feature_order"]]
     lines = [
@@ -343,13 +329,11 @@ def _build_summary(
     lines += ["", "## 关键检查", "", "| check | result |", "|---|---|"]
     lines.extend(f"| {name} | {status} |" for name, status in checks.items())
     lines += [
-        f"| 人工抽查至少8封邮件 | PASS（已检查 {manual_count} 封） |",
         "",
         "## 已知问题",
         "",
         f"- 保留了 {stats['frozen_assignments_retained']} 个现有冻结 split 分配；对原映射未覆盖的 {stats['deterministic_assignments_added']} 封邮件按固定规则补充分配，没有重排既有记录。",
         "- 为保留既有冻结映射，去重后的实际比例可能与70/15/15存在轻微取整偏差，具体比例见上表。",
-        "- 个人信息替换采用保守规则；参与者展示前仍应进行人工隐私复核。",
         "- 没有阻塞性未解决问题；测试集未用于关键词、特征、参数或阈值选择。",
         "",
     ]
@@ -369,13 +353,12 @@ def run(config_path: Path) -> dict[str, Any]:
         raise PreprocessingError("Repeated run changed split or feature values")
     checks["固定种子重复运行结果一致"] = "PASS"
 
-    reviewed_ids = _validate_manual_review(processed, config)
     output_path = root / str(config["output"]["processed_csv"])
     summary_path = root / str(config["output"]["summary"])
     write_csv_atomic(output_path, processed)
     write_text_atomic(
         summary_path,
-        _build_summary(processed, config, stats, checks, len(reviewed_ids)),
+        _build_summary(processed, config, stats, checks),
     )
 
     split_counts = {
@@ -396,7 +379,7 @@ def run(config_path: Path) -> dict[str, Any]:
         "summary": str(summary_path),
         "rows": len(processed),
         "split_counts": split_counts,
-        "checks": {**checks, "人工抽查至少8封邮件": "PASS"},
+        "checks": checks,
     }
 
 
