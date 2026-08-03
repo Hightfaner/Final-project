@@ -1,48 +1,176 @@
-dataset_path: data/raw/Nazario_5.csv
-output_root: data
-reports_root: reports
-log_path: logs/pipeline.jsonl
-
 dataset:
-  expected_raw_rows: 3065
-  expected_eligible_rows: 3063
+  path: data/raw/Nazario_5.csv
   encoding: utf-8-sig
-  require_read_only: true
+  expected_rows: 3065
+  columns:
+    subject: subject
+    body: body
+    label: label
+  labels:
+    "0": 0
+    "1": 1
 
 split:
-  train_ratio: 0.70
-  validation_ratio: 0.15
-  test_ratio: 0.15
-  expected_counts:
-    train: 2144
-    validation: 460
-    test: 459
   seed: 42
-  max_ratio_deviation: 0.02
-  max_class_ratio_deviation: 0.03
-
-template_grouping:
-  exact_signature: true
-  near_similarity_enabled: true
-  cosine_threshold: 0.95
-  char_ngram_range: [3, 5]
-  min_df: 2
-  max_features: 100000
-  max_group_size: 250
-
-duplicates:
-  policy: keep_all_grouped
-
-sanitisation:
-  version: "1.0"
-  preserve_case: true
-  preserve_exclamation_marks: true
-  render_urls_as_static_markers: true
-
-feature_config: configs/feature_contract.json
-keyword_config: configs/keywords.json
-column_mapping: configs/column_mapping.yaml
+  ratios:
+    train: 0.70
+    validation: 0.15
+    test: 0.15
+  frozen_ids:
+    train: data/splits/train_ids.csv
+    validation: data/splits/validation_ids.csv
+    test: data/splits/test_ids.csv
 
 output:
-  refuse_final_overwrite: true
+  processed_csv: data/processed/processed_emails.csv
+  summary: reports/preprocessing_summary.md
 
+feature_order:
+  - url_count
+  - ip_address_url_count
+  - urgency_word_count
+  - credential_word_count
+  - action_word_count
+  - money_related_word_count
+  - uppercase_letter_ratio
+  - exclamation_mark_count
+
+keywords:
+  keywords_version: "1.0"
+  keywords_status: frozen
+  frozen_date: "2026-07-30"
+  matching:
+    case_sensitive: false
+    whole_word_or_phrase: true
+    count_all_occurrences: true
+    phrase_first: true
+  variant_normalisation:
+    de-activated: deactivated
+    de-activation: deactivation
+    on-hold: on hold
+    sign-in: sign in
+    log-in: log in
+    user-id: user id
+    credit-card: credit card
+    debit-card: debit card
+    e-mail: email
+    re-validate: validate
+    revalidate: validate
+    re-confirm: confirm
+    reconfirm: confirm
+    re-verify: verify
+    reverify: verify
+  urgency:
+    - urgent
+    - urgently
+    - immediate
+    - immediately
+    - action required
+    - warning
+    - alert
+    - within 24 hours
+    - within 48 hours
+    - as soon as possible
+    - expire
+    - expires
+    - expired
+    - expiration
+    - suspended
+    - suspension
+    - deactivated
+    - deactivation
+    - blocked
+    - on hold
+    - pending
+    - locked
+    - disabled
+    - restricted
+    - unusual activity
+    - suspicious activity
+  credential:
+    - account
+    - mailbox
+    - password
+    - passcode
+    - pin
+    - username
+    - user id
+    - login
+    - log in
+    - sign in
+    - credentials
+    - authentication
+    - identity
+    - verification
+    - security code
+    - access code
+    - personal information
+    - email address
+    - phone number
+  action:
+    - verify
+    - validate
+    - confirm
+    - update
+    - click
+    - download
+    - submit
+    - provide
+    - enter
+    - review
+    - respond
+    - reply
+    - activate
+    - unlock
+    - restore
+    - renew
+    - upgrade
+    - complete
+    - follow
+    - visit
+    - view
+  money_related:
+    - payment
+    - invoice
+    - bank
+    - banking
+    - transaction
+    - transfer
+    - deposit
+    - refund
+    - billing
+    - bill
+    - credit card
+    - debit card
+    - balance
+    - money
+    - funds
+    - fee
+    - charge
+    - purchase
+    - receipt
+    - tax
+    - loan
+    - mortgage
+    - dollar
+    - dollars
+    - usd
+    - pound
+    - pounds
+    - gbp
+    - euro
+    - euros
+    - eur
+
+manual_spot_check:
+  status: approved
+  reviewed_date: "2026-08-03"
+  email_ids:
+    - nazario5_001389_1d47fe42ba62
+    - nazario5_000032_90f6e6f881ba
+    - nazario5_000049_d0bbbadb2a60
+    - nazario5_000005_9ef6465b5cd4
+    - nazario5_000002_42a5d0fa9de4
+    - nazario5_000008_df5ea7b67cd2
+    - nazario5_000012_0a1759370397
+    - nazario5_000053_9876d7ba1637

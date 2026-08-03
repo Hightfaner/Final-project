@@ -1,6 +1,0 @@
-{
-  "command": ".\\.venv\\Scripts\\python.exe -m pytest -q",
-  "exit_code": 0,
-  "passed": 35,
-  "status": "PASS"
-}
