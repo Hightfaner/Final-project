@@ -287,13 +287,11 @@ def _implementation_report(
         "| Final outputs | PASS | Non-provisional all/train/validation/test matrices generated. |",
         f"| Automated tests | PASS | {test_result['passed']} tests passed with exit {test_result['exit_code']}. |",
         "| Validate-only | PENDING | Recorded after the required post-final command. |",
-        "| Research boundary | PASS | No classifier, model metric, explanation, or stimulus code executed. |",
         "",
         "## Remaining risks",
         "",
         "- Any mixed-label sanitised duplicate group listed in `researcher_review_required.md` remains a researcher decision; records stay grouped and unchanged.",
         "- Near-template grouping uses the documented engineering defaults (seed 42, char 3–5gram TF-IDF, cosine >=0.95) and is not a model-performance choice.",
-        "- Formal participant-facing stimuli still require later manual privacy/display review.",
         "",
     ]
     return "\n".join(lines)
@@ -466,12 +464,6 @@ def run_final(config_path: Path, overwrite: bool = False) -> dict[str, Any]:
             ]
         },
         "code_revision": _git_revision(root),
-        "research_boundary": {
-            "model_training": False,
-            "test_model_performance": False,
-            "explanations_generated": False,
-            "stimuli_selected": False,
-        },
     }
     write_json_atomic(splits / "split_manifest.json", manifest)
     write_json_atomic(reports_root / "dataset_audit.json", audit)
@@ -523,8 +515,6 @@ def run_validate_only(config_path: Path) -> dict[str, Any]:
             f"- Cross-split template groups: {result['cross_split_template_group_violations']}",
             f"- Matrix shapes: {result['matrix_shapes']}",
             f"- Keyword non-zero rows: {result['keyword_nonzero_rows']}",
-            "",
-            "No model was trained or evaluated, and no explanations or stimuli were generated.",
             "",
         ]
     )

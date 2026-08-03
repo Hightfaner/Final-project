@@ -42,12 +42,6 @@
   "keywords_status": "frozen",
   "keywords_version": "1.0",
   "manifest_version": "1.0",
-  "research_boundary": {
-    "explanations_generated": false,
-    "model_training": false,
-    "stimuli_selected": false,
-    "test_model_performance": false
-  },
   "sanitisation_version": "1.0",
   "seed": 42,
   "split_summary": {

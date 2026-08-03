@@ -43,10 +43,8 @@
 | Final outputs | PASS | Non-provisional all/train/validation/test matrices generated. |
 | Automated tests | PASS | 35 tests passed with exit 0. |
 | Validate-only | PASS | Required post-final bundle validation completed with exit 0. |
-| Research boundary | PASS | No classifier, model metric, explanation, or stimulus code executed. |
 
 ## Remaining risks
 
 - Any mixed-label sanitised duplicate group listed in `researcher_review_required.md` remains a researcher decision; records stay grouped and unchanged.
 - Near-template grouping uses the documented engineering defaults (seed 42, char 3–5gram TF-IDF, cosine >=0.95) and is not a model-performance choice.
-- Formal participant-facing stimuli still require later manual privacy/display review.

@@ -7,5 +7,3 @@
 - Cross-split template groups: 0
 - Matrix shapes: {'all': [3063, 15], 'train': [2144, 15], 'validation': [460, 15], 'test': [459, 15]}
 - Keyword non-zero rows: {'urgency_word_count': 1103, 'credential_word_count': 1348, 'action_word_count': 2047, 'money_related_word_count': 731}
-
-No model was trained or evaluated, and no explanations or stimuli were generated.
