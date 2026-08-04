@@ -4,3 +4,4 @@ pandas>=2.2,<4
 PyYAML>=6.0,<7
 pytest>=8.0,<10
 scikit-learn>=1.5,<2
+xgboost>=2.1,<4

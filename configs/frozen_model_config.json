@@ -1,0 +1,28 @@
+{
+  "feature_order": [
+    "url_count",
+    "ip_address_url_count",
+    "urgency_word_count",
+    "credential_word_count",
+    "action_word_count",
+    "money_related_word_count",
+    "uppercase_letter_ratio",
+    "exclamation_mark_count"
+  ],
+  "label_definition": {
+    "0": "legitimate",
+    "1": "phishing"
+  },
+  "hyperparameters": {
+    "max_depth": 4,
+    "learning_rate": 0.05,
+    "n_estimators": 200,
+    "min_child_weight": 5,
+    "subsample": 0.8,
+    "colsample_bytree": 1.0,
+    "objective": "binary:logistic",
+    "eval_metric": "logloss"
+  },
+  "classification_threshold": 0.35,
+  "random_seed": 42
+}
