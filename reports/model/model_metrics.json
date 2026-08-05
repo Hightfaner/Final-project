@@ -1,0 +1,94 @@
+{
+  "selection": {
+    "hyperparameter_selection_metric": "validation_balanced_accuracy",
+    "hyperparameter_selection_threshold": 0.5,
+    "hyperparameter_candidate_count": 24,
+    "hyperparameter_tie_breaking": [
+      "lower max_depth",
+      "lower n_estimators",
+      "higher min_child_weight",
+      "lower learning_rate"
+    ],
+    "threshold_selection_metric": "validation_balanced_accuracy",
+    "threshold_start": 0.3,
+    "threshold_end": 0.7,
+    "threshold_step": 0.01,
+    "threshold_tie_breaking": "closest to 0.50, then lower threshold"
+  },
+  "validation": {
+    "precision": 0.8770491803278688,
+    "recall": 0.9344978165938864,
+    "f1": 0.904862579281184,
+    "balanced_accuracy": 0.9005822416302766,
+    "confusion_matrix": [
+      [
+        195,
+        30
+      ],
+      [
+        15,
+        214
+      ]
+    ],
+    "tn": 195,
+    "fp": 30,
+    "fn": 15,
+    "tp": 214
+  },
+  "test": {
+    "precision": 0.8102766798418972,
+    "recall": 0.8951965065502183,
+    "f1": 0.8506224066390041,
+    "balanced_accuracy": 0.839974934889459,
+    "confusion_matrix": [
+      [
+        175,
+        48
+      ],
+      [
+        24,
+        205
+      ]
+    ],
+    "tn": 175,
+    "fp": 48,
+    "fn": 24,
+    "tp": 205
+  },
+  "test_outcome_availability": {
+    "by_outcome_type": {
+      "TP": {
+        "count": 205,
+        "at_least_4": true,
+        "at_least_6": true
+      },
+      "TN": {
+        "count": 175,
+        "at_least_4": true,
+        "at_least_6": true
+      },
+      "FP": {
+        "count": 48,
+        "at_least_4": true,
+        "at_least_6": true
+      },
+      "FN": {
+        "count": 24,
+        "at_least_4": true,
+        "at_least_6": true
+      }
+    },
+    "all_types_at_least_4": true,
+    "all_types_at_least_6": true
+  },
+  "reload_prediction_consistency": {
+    "probabilities_match": true,
+    "labels_match": true
+  },
+  "row_counts": {
+    "train": 2144,
+    "validation": 454,
+    "test": 452
+  },
+  "processed_csv_sha256": "ae42ee07af5d38346603d1a3f792c5e38a77e0f8e8d5905fdcba0cab7a957945"
+}

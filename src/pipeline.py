@@ -1,592 +1,400 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-import os
-import shutil
-import stat
-import subprocess
+import math
 import sys
-import uuid
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
-from src.audit import audit_markdown, build_dataset_audit
-from src.features import FEATURE_ORDER, KeywordMatcher, feature_frame
-from src.io_utils import (
-    JsonlLogger,
-    canonical_json_hash,
-    ensure_directories,
-    file_hash,
-    load_json,
-    load_yaml,
-    utc_now,
-    write_csv_atomic,
-    write_json_atomic,
-    write_text_atomic,
-)
-from src.sanitiser import meaningful_body, sanitise_text
-from src.schema import DatasetSnapshot, load_canonical_dataset
-from src.splitter import SPLIT_ORDER, build_fixed_split
-from src.template_grouping import GroupingResult, build_groups
-from src.validation import (
-    FINAL_MATRIX_COLUMNS,
-    ValidationError,
-    validate_feature_contract,
-    validate_feature_values,
-    validate_output_bundle,
-    validate_sanitised_content,
-)
+from src.features import KeywordMatcher, feature_frame
+from src.io_utils import load_yaml, write_csv_atomic, write_text_atomic
+from src.sanitiser import sanitise_text
+from src.schema import load_canonical_dataset
+
+
+SPLIT_ORDER = ("train", "validation", "test")
+BASE_OUTPUT_COLUMNS = [
+    "email_id",
+    "sanitized_subject",
+    "sanitized_body",
+    "label",
+    "split",
+]
+
+
+class PreprocessingError(RuntimeError):
+    """Raised when a minimal preprocessing rule cannot be satisfied safely."""
 
 
 def _resolve_root(config_path: Path) -> Path:
     return config_path.resolve().parent.parent
 
 
-def _sanitise_frame(canonical: pd.DataFrame, version: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _sanitise_frame(canonical: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     rows: list[dict[str, Any]] = []
-    exclusions: list[dict[str, Any]] = []
+    removed_blank = 0
     for row in canonical.itertuples(index=False):
-        subject = sanitise_text(row.raw_subject)
-        body = sanitise_text(row.raw_body)
-        if sanitise_text(subject.text).text != subject.text:
-            raise ValidationError(f"Subject sanitisation is not idempotent for {row.email_id}")
-        if sanitise_text(body.text).text != body.text:
-            raise ValidationError(f"Body sanitisation is not idempotent for {row.email_id}")
-        eligible = meaningful_body(body.text)
-        reason = "" if eligible else "body_missing_or_empty_after_sanitisation"
-        record = {
-            "email_id": row.email_id,
-            "original_row_number": int(row.original_row_number),
-            "label_original": int(row.label_original),
-            "label_text": row.label_text,
-            "sanitised_subject": subject.text,
-            "sanitised_body": body.text,
-            "sanitisation_version": version,
-            "url_replacement_count": subject.url_replacement_count + body.url_replacement_count,
-            "pii_replacement_count": subject.pii_replacement_count + body.pii_replacement_count,
-            "removed_active_content_count": (
-                subject.removed_active_content_count + body.removed_active_content_count
-            ),
-            "processing_status": "eligible" if eligible else "excluded",
-            "exclusion_reason": reason,
-        }
-        rows.append(record)
-        if not eligible:
-            exclusions.append(
-                {
-                    "email_id": row.email_id,
-                    "original_row_number": int(row.original_row_number),
-                    "label_original": int(row.label_original),
-                    "stage": "sanitisation",
-                    "reason": reason,
-                    "rule_version": version,
-                }
+        subject = sanitise_text(row.raw_subject).text
+        body = sanitise_text(row.raw_body).text
+        if not subject.strip() and not body.strip():
+            removed_blank += 1
+            continue
+        rows.append(
+            {
+                "email_id": row.email_id,
+                "original_row_number": int(row.original_row_number),
+                "sanitized_subject": subject,
+                "sanitized_body": body,
+                "label": int(row.label),
+            }
+        )
+    return pd.DataFrame(rows), removed_blank
+
+
+def _exact_deduplicate(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
+    work = frame.copy()
+    work["exact_duplicate_key"] = (
+        work["sanitized_subject"] + "\n" + work["sanitized_body"]
+    ).str.lower().str.replace(r"\s+", " ", regex=True).str.strip()
+
+    grouped = work.groupby("exact_duplicate_key", sort=False, dropna=False)
+    label_counts = grouped["label"].nunique()
+    conflicting_keys = set(label_counts[label_counts.gt(1)].index)
+    if conflicting_keys:
+        conflicts = work.loc[
+            work["exact_duplicate_key"].isin(conflicting_keys), ["email_id", "label"]
+        ]
+        raise PreprocessingError(
+            "Conflicting labels found in exact duplicate groups: "
+            + ", ".join(
+                f"{row.email_id}:{row.label}" for row in conflicts.head(20).itertuples(index=False)
             )
-    return pd.DataFrame(rows), pd.DataFrame(
-        exclusions,
-        columns=[
-            "email_id",
-            "original_row_number",
-            "label_original",
-            "stage",
-            "reason",
-            "rule_version",
-        ],
-    )
-
-
-def _feature_report(matrix: pd.DataFrame, keyword_config: dict[str, Any]) -> str:
-    lines = [
-        "# Final Eight-Feature Report",
-        "",
-        f"- Feature contract: version 1.0, status frozen",
-        f"- Keyword version: {keyword_config['keywords_version']}",
-        f"- Keyword status: {keyword_config['keywords_status']}",
-        f"- Frozen date: {keyword_config['frozen_date']}",
-        "- Text source: `sanitised_subject` + newline + `sanitised_body`",
-        "",
-        "## Feature statistics",
-        "",
-        "| Feature | Min | Max | Mean | Median | Zero ratio |",
-        "|---|---:|---:|---:|---:|---:|",
-    ]
-    for column in FEATURE_ORDER:
-        values = matrix[column]
-        lines.append(
-            f"| {column} | {values.min():.6g} | {values.max():.6g} | "
-            f"{values.mean():.6g} | {values.median():.6g} | {values.eq(0).mean():.6f} |"
         )
-    lines += [
-        "",
-        "## Keyword-feature non-zero email counts by ground-truth label",
-        "",
-        "These descriptive counts are reported only after the researcher-approved freeze and were not used to select or modify any keyword.",
-        "",
-        "| Feature | phishing | legitimate |",
-        "|---|---:|---:|",
-    ]
-    for column in FEATURE_ORDER[2:6]:
-        counts = matrix.assign(nonzero=matrix[column].gt(0)).groupby("label_text")["nonzero"].sum()
-        lines.append(
-            f"| {column} | {int(counts.get('phishing', 0))} | {int(counts.get('legitimate', 0))} |"
-        )
-    lines.append("")
-    return "\n".join(lines)
 
-
-def _keyword_freeze_report(keyword_config: dict[str, Any]) -> str:
-    config_hash = canonical_json_hash(keyword_config)
-    lines = [
-        "# Keyword Freeze Report",
-        "",
-        f"- Version: {keyword_config['keywords_version']}",
-        f"- Status: {keyword_config['keywords_status']}",
-        f"- Frozen date: {keyword_config['frozen_date']}",
-        f"- Canonical configuration SHA-256: `{config_hash}`",
-        "",
-        "The lists were supplied as a researcher-approved semantic operationalisation before model evaluation. No validation/test label-conditional frequency, hit-rate, discrimination statistic, or model result was used.",
-        "",
-        "## Matching contract",
-        "",
-        "- Case-insensitive temporary matching copy; persisted sanitised text is unchanged.",
-        "- Whole-word/whole-phrase, phrase-first, non-overlapping occurrence counts.",
-        "- Fixed variant normalisation only; no stemming, lemmatisation, fuzzy matching, or expansion.",
-        "- Input fields are only `sanitised_subject` and `sanitised_body`.",
-        "",
-    ]
-    for category in ("urgency", "credential", "action", "money_related"):
-        lines += [f"## {category}", "", ", ".join(keyword_config[category]), ""]
-    return "\n".join(lines)
-
-
-def _review_report(grouping: GroupingResult) -> str:
-    mixed = grouping.frame.loc[
-        grouping.frame["duplicate_group_size"].gt(1)
-        & ~grouping.frame["duplicate_label_consistent"],
-        ["email_id", "label_text", "duplicate_group_id"],
-    ].sort_values(["duplicate_group_id", "email_id"])
-    lines = [
-        "# Researcher Review Required",
-        "",
-        "Sanitised duplicate groups are retained under `keep_all_grouped`; no record is deleted, merged, or relabelled.",
-        "",
-    ]
-    if mixed.empty:
-        lines.append("No sanitised exact-duplicate group contains mixed ground-truth labels.")
-    else:
-        lines += [
-            "The following sanitised exact-duplicate groups contain mixed ground-truth labels and require researcher review. They remain grouped in one split.",
-            "",
-            "| duplicate_group_id | email_id | label_text |",
-            "|---|---|---|",
-        ]
-        for row in mixed.itertuples(index=False):
-            lines.append(f"| {row.duplicate_group_id} | {row.email_id} | {row.label_text} |")
-    lines.append("")
-    return "\n".join(lines)
-
-
-def _git_revision(root: Path) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=False,
+    sizes = grouped.size()
+    duplicate_keys = set(sizes[sizes.gt(1)].index)
+    duplicate_records = int(work["exact_duplicate_key"].isin(duplicate_keys).sum())
+    deduplicated = (
+        work.sort_values("original_row_number")
+        .drop_duplicates("exact_duplicate_key", keep="first")
+        .drop(columns="exact_duplicate_key")
+        .reset_index(drop=True)
     )
-    return result.stdout.strip() if result.returncode == 0 else "uncommitted-initial-implementation"
-
-
-def _write_checksums(root: Path, reports_root: Path) -> dict[str, str]:
-    candidates = [
-        root / "README.md",
-        root / "requirements.txt",
-        root / "pyproject.toml",
-        root / "run_pipeline.py",
-        root / "configs" / "pipeline.yaml",
-        root / "configs" / "column_mapping.yaml",
-        root / "configs" / "keywords.json",
-        root / "configs" / "feature_contract.json",
-        root / "data" / "raw" / "Nazario_5.csv",
-        *sorted((root / "data" / "interim").glob("*")),
-        *sorted((root / "data" / "splits").glob("*")),
-        *sorted((root / "data" / "processed").glob("*")),
-        *sorted(path for path in reports_root.glob("*.md")),
-        *sorted(path for path in reports_root.glob("*.json") if path.name != "output_checksums.json"),
-        *sorted((root / "src").rglob("*.py")),
-        *sorted((root / "tests").rglob("*.py")),
-    ]
-    checksum_path = reports_root / "output_checksums.json"
-    hashes = {
-        path.relative_to(root).as_posix(): file_hash(path)
-        for path in candidates
-        if path.is_file() and path != checksum_path
-    }
-    write_json_atomic(checksum_path, {"algorithm": "sha256", "sha256": hashes})
-    return hashes
-
-
-def _implementation_report(
-    snapshot: DatasetSnapshot,
-    grouping: GroupingResult,
-    split_summary: dict[str, Any],
-    matrix: pd.DataFrame,
-    matrix_paths: dict[str, Path],
-    raw_hash_after: str,
-    test_result: dict[str, Any],
-) -> str:
-    matrix_details = [
-        (name, len(pd.read_csv(path)), len(pd.read_csv(path, nrows=0).columns), file_hash(path))
-        for name, path in matrix_paths.items()
-    ]
-    lines = [
-        "# Week 6–7 Final Implementation Report",
-        "",
-        "## Commands and exit status",
-        "",
-        f"- `python -m pytest -q`: PASS (exit {test_result['exit_code']}; {test_result['passed']} passed).",
-        "- `python run_pipeline.py --config configs/pipeline.yaml --mode final`: PASS (exit 0).",
-        "- `python run_pipeline.py --config configs/pipeline.yaml --stage validate-only`: pending the required post-final validation command.",
-        "",
-        "## Frozen invariants",
-        "",
-        f"- Raw SHA-256 before: `{snapshot.sha256}`",
-        f"- Raw SHA-256 after: `{raw_hash_after}`",
-        f"- Eligible/excluded: {len(matrix)} / {snapshot.row_count - len(matrix)}",
-        f"- Split counts: {split_summary['actual_counts']}",
-        f"- Cross-split template groups: {split_summary['cross_split_template_group_violations']}",
-        f"- Raw exact duplicate groups/records: {grouping.summary['raw_exact_duplicate_groups']} / {grouping.summary['raw_exact_duplicate_records']}",
-        f"- Sanitised exact duplicate groups/records: {grouping.summary['sanitised_exact_duplicate_groups']} / {grouping.summary['sanitised_exact_duplicate_records']}",
-        f"- Mixed-label sanitised duplicate groups: {grouping.summary['mixed_label_sanitised_duplicate_groups']}",
-        "- Duplicate policy: `keep_all_grouped`.",
-        "- Keyword configuration: version 1.0, status frozen, date 2026-07-30.",
-        "- Feature contract: exactly eight columns in the frozen order.",
-        "",
-        "## Final matrices",
-        "",
-        "| Matrix | Rows | Columns | SHA-256 |",
-        "|---|---:|---:|---|",
-    ]
-    for name, rows, columns, digest in matrix_details:
-        lines.append(f"| {name} | {rows} | {columns} | `{digest}` |")
-    lines += [
-        "",
-        "## Definition of Done",
-        "",
-        "| Item | Status | Evidence |",
-        "|---|---|---|",
-        "| Dataset and raw protection | PASS | Read-only raw file; before/after SHA-256 identical. |",
-        "| Labels | PASS | Only configured 0=legitimate and 1=phishing mappings accepted. |",
-        "| Audit and sanitisation | PASS | Dataset audit, deterministic/idempotent safe text, exclusions recorded. |",
-        "| Duplicate/template grouping | PASS | Content-only grouping; keep-all policy; review report generated. |",
-        "| Fixed split | PASS | 2144/460/459, disjoint union, zero cross-group violations. |",
-        "| Frozen eight features | PASS | Names, order, source, ranges and model interface validated. |",
-        "| Frozen keywords | PASS | Version/status/date/lists/rules match the approved specification. |",
-        "| Final outputs | PASS | Non-provisional all/train/validation/test matrices generated. |",
-        f"| Automated tests | PASS | {test_result['passed']} tests passed with exit {test_result['exit_code']}. |",
-        "| Validate-only | PENDING | Recorded after the required post-final command. |",
-        "| Research boundary | PASS | No classifier, model metric, explanation, or stimulus code executed. |",
-        "",
-        "## Remaining risks",
-        "",
-        "- Any mixed-label sanitised duplicate group listed in `researcher_review_required.md` remains a researcher decision; records stay grouped and unchanged.",
-        "- Near-template grouping uses the documented engineering defaults (seed 42, char 3–5gram TF-IDF, cosine >=0.95) and is not a model-performance choice.",
-        "- Formal participant-facing stimuli still require later manual privacy/display review.",
-        "",
-    ]
-    return "\n".join(lines)
-
-
-def run_final(config_path: Path, overwrite: bool = False) -> dict[str, Any]:
-    root = _resolve_root(config_path)
-    config = load_yaml(config_path)
-    output_root = root / str(config["output_root"])
-    reports_root = root / str(config.get("reports_root", "reports"))
-    log_path = root / str(config.get("log_path", "logs/pipeline.jsonl"))
-    dataset_path = root / str(config["dataset_path"])
-    ensure_directories(
-        output_root / "interim",
-        output_root / "splits",
-        output_root / "processed",
-        reports_root,
-        log_path.parent,
-    )
-    final_guard = output_root / "processed" / "feature_matrix_all.csv"
-    if final_guard.exists() and config.get("output", {}).get("refuse_final_overwrite", True) and not overwrite:
-        raise FileExistsError(
-            f"Final outputs already exist at {final_guard}; rerun with explicit --overwrite only after verifying the manifest"
-        )
-    if not dataset_path.is_file():
-        raise FileNotFoundError(dataset_path)
-    if bool(dataset_path.stat().st_mode & stat.S_IWRITE):
-        raise PermissionError(f"Raw dataset must be read-only before final execution: {dataset_path}")
-
-    run_id = str(uuid.uuid4())
-    logger = JsonlLogger(log_path, run_id)
-    logger.event(
-        "pipeline",
-        "started",
-        mode="final",
-        command="run_pipeline.py --config configs/pipeline.yaml --mode final",
-    )
-    raw_hash_before = file_hash(dataset_path)
-    mapping = load_yaml(root / str(config["column_mapping"]))
-    feature_contract = load_json(root / str(config["feature_config"]))
-    keywords = load_json(root / str(config["keyword_config"]))
-    validate_feature_contract(feature_contract)
-    matcher = KeywordMatcher(keywords)
-    test_result_path = reports_root / "test_results.json"
-    if not test_result_path.is_file():
-        raise ValidationError("Required pre-final pytest evidence is missing: reports/test_results.json")
-    test_result = load_json(test_result_path)
-    if test_result.get("status") != "PASS" or int(test_result.get("exit_code", 1)) != 0:
-        raise ValidationError("Pre-final pytest evidence is not PASS")
-
-    canonical, snapshot = load_canonical_dataset(
-        dataset_path,
-        mapping,
-        str(config["dataset"]["encoding"]),
-        int(config["dataset"]["expected_raw_rows"]),
-    )
-    audit = build_dataset_audit(canonical, snapshot)
-    logger.event("input_audit", "passed", rows=len(canonical), dataset_sha256=snapshot.sha256)
-
-    sanitised, exclusions = _sanitise_frame(canonical, str(config["sanitisation"]["version"]))
-    validate_sanitised_content(sanitised)
-    eligible_count = int(sanitised["processing_status"].eq("eligible").sum())
-    expected_eligible = int(config["dataset"]["expected_eligible_rows"])
-    if eligible_count != expected_eligible:
-        raise ValidationError(f"Eligible row count {eligible_count} differs from expected {expected_eligible}")
-    logger.event("sanitisation", "passed", eligible=eligible_count, excluded=len(exclusions))
-
-    eligible_ids = set(sanitised.loc[sanitised["processing_status"].eq("eligible"), "email_id"])
-    grouping_input = canonical.loc[canonical["email_id"].isin(eligible_ids)].copy()
-    grouping_input = grouping_input.merge(
-        sanitised[["email_id", "sanitised_subject", "sanitised_body"]],
-        on="email_id",
-        how="left",
-        validate="one_to_one",
-    )
-    grouping = build_groups(grouping_input, config["template_grouping"])
-    logger.event("grouping", "passed", **grouping.summary)
-
-    split_result = build_fixed_split(grouping.frame, config["split"])
-    logger.event("split", "passed", **split_result.summary)
-
-    eligible = sanitised.loc[sanitised["processing_status"].eq("eligible")].copy()
-    eligible = eligible.merge(
-        grouping.template_groups[["email_id", "template_group_id"]],
-        on="email_id",
-        how="left",
-        validate="one_to_one",
-    ).merge(
-        split_result.assignments,
-        on="email_id",
-        how="left",
-        validate="one_to_one",
-    )
-    features = feature_frame(eligible, matcher)
-    matrix = pd.concat([eligible.reset_index(drop=True), features.reset_index(drop=True)], axis=1)
-    matrix["feature_contract_version"] = str(feature_contract["version"])
-    matrix = matrix[FINAL_MATRIX_COLUMNS].sort_values("email_id").reset_index(drop=True)
-    validate_feature_values(matrix)
-    logger.event("features", "passed", rows=len(matrix), feature_columns=FEATURE_ORDER)
-
-    interim = output_root / "interim"
-    splits = output_root / "splits"
-    processed = output_root / "processed"
-    write_csv_atomic(interim / "nazario_5_sanitised.csv", sanitised.sort_values("email_id"))
-    write_csv_atomic(interim / "duplicate_groups.csv", grouping.duplicate_groups)
-    write_csv_atomic(interim / "template_groups.csv", grouping.template_groups)
-    write_csv_atomic(interim / "template_similarity_pairs.csv", grouping.similarity_pairs)
-    write_csv_atomic(interim / "exclusions.csv", exclusions.sort_values("email_id"))
-
-    for split_name in SPLIT_ORDER:
-        ids = (
-            split_result.assignments.loc[split_result.assignments["split"].eq(split_name), ["email_id"]]
-            .sort_values("email_id")
-            .reset_index(drop=True)
-        )
-        write_csv_atomic(splits / f"{split_name}_ids.csv", ids)
-
-    matrix_paths = {"all": processed / "feature_matrix_all.csv"}
-    write_csv_atomic(matrix_paths["all"], matrix)
-    for split_name in SPLIT_ORDER:
-        path = processed / f"feature_matrix_{split_name}.csv"
-        subset = matrix.loc[matrix["split"].eq(split_name)].sort_values("email_id").reset_index(drop=True)
-        write_csv_atomic(path, subset)
-        matrix_paths[split_name] = path
-
-    raw_hash_after = file_hash(dataset_path)
-    if raw_hash_after != raw_hash_before:
-        raise ValidationError("Raw dataset SHA-256 changed during final processing")
-    manifest = {
-        "manifest_version": "1.0",
-        "created_utc": utc_now(),
-        "dataset_path": str(config["dataset_path"]),
-        "dataset_md5": snapshot.md5,
-        "dataset_sha256": snapshot.sha256,
-        "dataset_rows": snapshot.row_count,
-        "eligible_rows": len(matrix),
-        "excluded_rows": len(exclusions),
-        "sanitisation_version": str(config["sanitisation"]["version"]),
-        "template_grouping_version": "1.0",
-        "feature_contract_version": feature_contract["version"],
-        "keywords_version": keywords["keywords_version"],
-        "keywords_status": keywords["keywords_status"],
-        "keywords_frozen_date": keywords["frozen_date"],
-        "seed": int(config["split"]["seed"]),
-        "target_ratios": {
-            "train": float(config["split"]["train_ratio"]),
-            "validation": float(config["split"]["validation_ratio"]),
-            "test": float(config["split"]["test_ratio"]),
-        },
-        "split_summary": split_result.summary,
-        "duplicate_summary": grouping.summary,
-        "config_hashes": {
-            "pipeline.yaml": file_hash(config_path),
-            "column_mapping.yaml": file_hash(root / str(config["column_mapping"])),
-            "feature_contract.json": file_hash(root / str(config["feature_config"])),
-            "keywords.json": file_hash(root / str(config["keyword_config"])),
-        },
-        "artifact_sha256": {
-            path.relative_to(root).as_posix(): file_hash(path)
-            for path in [
-                interim / "nazario_5_sanitised.csv",
-                interim / "duplicate_groups.csv",
-                interim / "template_groups.csv",
-                interim / "template_similarity_pairs.csv",
-                interim / "exclusions.csv",
-                splits / "train_ids.csv",
-                splits / "validation_ids.csv",
-                splits / "test_ids.csv",
-                *matrix_paths.values(),
-            ]
-        },
-        "code_revision": _git_revision(root),
-        "research_boundary": {
-            "model_training": False,
-            "test_model_performance": False,
-            "explanations_generated": False,
-            "stimuli_selected": False,
-        },
-    }
-    write_json_atomic(splits / "split_manifest.json", manifest)
-    write_json_atomic(reports_root / "dataset_audit.json", audit)
-    write_text_atomic(reports_root / "dataset_audit.md", audit_markdown(audit))
-    write_text_atomic(reports_root / "feature_report.md", _feature_report(matrix, keywords))
-    write_text_atomic(reports_root / "keyword_freeze_report.md", _keyword_freeze_report(keywords))
-    write_text_atomic(reports_root / "researcher_review_required.md", _review_report(grouping))
-    implementation = _implementation_report(
-        snapshot,
-        grouping,
-        split_result.summary,
-        matrix,
-        matrix_paths,
-        raw_hash_after,
-        test_result,
-    )
-    write_text_atomic(reports_root / "implementation_report.md", implementation)
-    hashes = _write_checksums(root, reports_root)
-    logger.event("pipeline", "passed", mode="final", exit_code=0, output_file_count=len(hashes))
-    return {
-        "status": "PASS",
-        "rows": len(matrix),
-        "split_counts": split_result.summary["actual_counts"],
-        "dataset_sha256": snapshot.sha256,
-        "grouping": grouping.summary,
+    return deduplicated, {
+        "exact_duplicate_groups": len(duplicate_keys),
+        "exact_duplicate_records": duplicate_records,
+        "exact_duplicates_removed": len(work) - len(deduplicated),
+        "conflicting_duplicate_groups": 0,
     }
 
 
-def run_validate_only(config_path: Path) -> dict[str, Any]:
-    root = _resolve_root(config_path)
-    config = load_yaml(config_path)
-    reports_root = root / str(config.get("reports_root", "reports"))
-    log_path = root / str(config.get("log_path", "logs/pipeline.jsonl"))
-    logger = JsonlLogger(log_path, str(uuid.uuid4()))
-    logger.event(
-        "validate_only",
-        "started",
-        command="run_pipeline.py --config configs/pipeline.yaml --stage validate-only",
+def _largest_remainder(total: int, ratios: dict[str, float]) -> dict[str, int]:
+    exact = {name: total * float(ratios[name]) for name in SPLIT_ORDER}
+    result = {name: math.floor(exact[name]) for name in SPLIT_ORDER}
+    remaining = total - sum(result.values())
+    ranked = sorted(
+        SPLIT_ORDER,
+        key=lambda name: (-(exact[name] - result[name]), SPLIT_ORDER.index(name)),
     )
-    result = validate_output_bundle(root, config)
-    report = "\n".join(
-        [
-            "# Validate-Only Report",
-            "",
-            "- Status: **PASS**",
-            f"- Dataset SHA-256: `{result['dataset_sha256']}`",
-            f"- Raw / eligible / excluded rows: {result['raw_rows']} / {result['eligible_rows']} / {result['excluded_rows']}",
-            f"- Split counts: {result['split_counts']}",
-            f"- Cross-split template groups: {result['cross_split_template_group_violations']}",
-            f"- Matrix shapes: {result['matrix_shapes']}",
-            f"- Keyword non-zero rows: {result['keyword_nonzero_rows']}",
-            "",
-            "No model was trained or evaluated, and no explanations or stimuli were generated.",
-            "",
-        ]
-    )
-    write_text_atomic(reports_root / "validation_report.md", report)
-    implementation_path = reports_root / "implementation_report.md"
-    implementation = implementation_path.read_text(encoding="utf-8")
-    implementation = implementation.replace(
-        "- `python run_pipeline.py --config configs/pipeline.yaml --stage validate-only`: pending the required post-final validation command.",
-        "- `python run_pipeline.py --config configs/pipeline.yaml --stage validate-only`: PASS (exit 0).",
-    ).replace(
-        "| Validate-only | PENDING | Recorded after the required post-final command. |",
-        "| Validate-only | PASS | Required post-final bundle validation completed with exit 0. |",
-    )
-    write_text_atomic(implementation_path, implementation)
-    _write_checksums(root, reports_root)
-    logger.event(
-        "validate_only",
-        "passed",
-        exit_code=0,
-        validation_status=result["status"],
-        **{key: value for key, value in result.items() if key != "status"},
-    )
+    for name in ranked[:remaining]:
+        result[name] += 1
     return result
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Frozen Week 6–7 phishing-email data pipeline")
-    parser.add_argument("--config", default="configs/pipeline.yaml")
-    selector = parser.add_mutually_exclusive_group()
-    selector.add_argument("--mode", choices=["final"])
-    selector.add_argument("--stage", choices=["validate-only"])
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Explicitly replace existing final outputs after manifest review",
+def _stable_order(email_id: str, seed: int) -> str:
+    return hashlib.sha256(f"{seed}:{email_id}".encode("utf-8")).hexdigest()
+
+
+def _read_frozen_split(
+    root: Path,
+    split_config: dict[str, Any],
+    known_email_ids: set[str],
+) -> dict[str, str] | None:
+    paths = {
+        name: root / str(split_config.get("frozen_ids", {}).get(name, ""))
+        for name in SPLIT_ORDER
+    }
+    present = {name: path.is_file() for name, path in paths.items()}
+    if not any(present.values()):
+        return None
+    if not all(present.values()):
+        raise PreprocessingError("Frozen split is incomplete; expected train, validation and test files")
+
+    mapping: dict[str, str] = {}
+    for split_name, path in paths.items():
+        ids = pd.read_csv(path)
+        if list(ids.columns) != ["email_id"] or not ids["email_id"].astype(str).is_unique:
+            raise PreprocessingError(f"Invalid frozen split file: {path}")
+        for email_id in ids["email_id"].astype(str):
+            if email_id in mapping:
+                raise PreprocessingError(f"Frozen email_id appears in multiple splits: {email_id}")
+            mapping[email_id] = split_name
+
+    unknown = sorted(set(mapping) - known_email_ids)
+    if unknown:
+        raise PreprocessingError(f"Frozen split contains unknown email_id values: {unknown[:5]}")
+    return mapping
+
+
+def _new_stratified_split(
+    frame: pd.DataFrame,
+    ratios: dict[str, float],
+    seed: int,
+) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for label in (0, 1):
+        ids = frame.loc[frame["label"].eq(label), "email_id"].astype(str).tolist()
+        ids.sort(key=lambda email_id: _stable_order(email_id, seed))
+        targets = _largest_remainder(len(ids), ratios)
+        offset = 0
+        for split_name in SPLIT_ORDER:
+            for email_id in ids[offset : offset + targets[split_name]]:
+                mapping[email_id] = split_name
+            offset += targets[split_name]
+    return mapping
+
+
+def _assign_splits(
+    frame: pd.DataFrame,
+    canonical_ids: set[str],
+    root: Path,
+    split_config: dict[str, Any],
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    ratios = {name: float(split_config["ratios"][name]) for name in SPLIT_ORDER}
+    if not math.isclose(sum(ratios.values()), 1.0, abs_tol=1e-12):
+        raise PreprocessingError("Split ratios must sum to 1")
+    seed = int(split_config["seed"])
+    frozen = _read_frozen_split(root, split_config, canonical_ids)
+    if frozen is None:
+        mapping = _new_stratified_split(frame, ratios, seed)
+        source = "new_stratified_seed_42"
+        retained = 0
+    else:
+        mapping = {email_id: frozen[email_id] for email_id in frame["email_id"] if email_id in frozen}
+        retained = len(mapping)
+        missing = frame.loc[~frame["email_id"].isin(mapping)].copy()
+        missing["order"] = missing["email_id"].map(lambda value: _stable_order(str(value), seed))
+        target_total = _largest_remainder(len(frame), ratios)
+        target_by_label = {
+            label: _largest_remainder(int(frame["label"].eq(label).sum()), ratios)
+            for label in (0, 1)
+        }
+        for row in missing.sort_values("order").itertuples(index=False):
+            current_total = {name: sum(value == name for value in mapping.values()) for name in SPLIT_ORDER}
+            label_ids = set(frame.loc[frame["label"].eq(row.label), "email_id"].astype(str))
+            current_label = {
+                name: sum(email_id in label_ids and split == name for email_id, split in mapping.items())
+                for name in SPLIT_ORDER
+            }
+            chosen = max(
+                SPLIT_ORDER,
+                key=lambda name: (
+                    target_by_label[int(row.label)][name] - current_label[name],
+                    target_total[name] - current_total[name],
+                    -SPLIT_ORDER.index(name),
+                ),
+            )
+            mapping[str(row.email_id)] = chosen
+        source = "existing_frozen_mapping_with_deterministic_extension"
+
+    result = frame.copy()
+    result["split"] = result["email_id"].map(mapping)
+    if result["split"].isna().any():
+        raise PreprocessingError("At least one retained email has no split assignment")
+    return result, {
+        "split_source": source,
+        "frozen_assignments_retained": retained,
+        "deterministic_assignments_added": len(result) - retained if frozen is not None else 0,
+    }
+
+
+def build_processed_frame(root: Path, config: dict[str, Any]) -> tuple[pd.DataFrame, dict[str, Any]]:
+    dataset_config = config["dataset"]
+    canonical = load_canonical_dataset(root / str(dataset_config["path"]), dataset_config)
+    sanitised, blank_removed = _sanitise_frame(canonical)
+    deduplicated, duplicate_stats = _exact_deduplicate(sanitised)
+    assigned, split_stats = _assign_splits(
+        deduplicated,
+        set(canonical["email_id"].astype(str)),
+        root,
+        config["split"],
     )
+
+    feature_order = [str(value) for value in config["feature_order"]]
+    matcher = KeywordMatcher(config["keywords"])
+    features = feature_frame(assigned, matcher, feature_order)
+    processed = pd.concat(
+        [assigned.reset_index(drop=True), features.reset_index(drop=True)], axis=1
+    )
+    processed = processed[BASE_OUTPUT_COLUMNS + feature_order].sort_values("email_id").reset_index(drop=True)
+    stats = {
+        "input_rows": len(canonical),
+        "blank_rows_removed": blank_removed,
+        "rows_after_blank_rule": len(sanitised),
+        "output_rows": len(processed),
+        **duplicate_stats,
+        **split_stats,
+    }
+    return processed, stats
+
+
+def _validate_output(frame: pd.DataFrame, feature_order: list[str]) -> dict[str, str]:
+    required = BASE_OUTPUT_COLUMNS + feature_order
+    if list(frame.columns) != required or set(frame["label"]) != {0, 1}:
+        raise PreprocessingError("Required columns or binary labels are invalid")
+    checks = {"必需列存在且标签仅为0/1": "PASS"}
+
+    for column in feature_order:
+        if not pd.api.types.is_numeric_dtype(frame[column]):
+            raise PreprocessingError(f"Feature is not numeric: {column}")
+        if not frame[column].map(lambda value: math.isfinite(float(value))).all():
+            raise PreprocessingError(f"Feature contains NaN or Inf: {column}")
+    checks["8项特征均为有限数值"] = "PASS"
+
+    if not frame["uppercase_letter_ratio"].between(0, 1).all():
+        raise PreprocessingError("uppercase_letter_ratio is outside [0, 1]")
+    count_features = [name for name in feature_order if name != "uppercase_letter_ratio"]
+    if (frame[count_features] < 0).any().any():
+        raise PreprocessingError("A count feature is negative")
+    checks["比例与计数特征范围合法"] = "PASS"
+
+    if not frame["email_id"].is_unique or set(frame["split"]) != set(SPLIT_ORDER):
+        raise PreprocessingError("email_id uniqueness or split values are invalid")
+    split_sets = {
+        name: set(frame.loc[frame["split"].eq(name), "email_id"].astype(str))
+        for name in SPLIT_ORDER
+    }
+    if any(
+        split_sets[left] & split_sets[right]
+        for index, left in enumerate(SPLIT_ORDER)
+        for right in SPLIT_ORDER[index + 1 :]
+    ):
+        raise PreprocessingError("An email_id appears in multiple splits")
+    checks["email_id唯一且三个split互斥"] = "PASS"
+
+    for split_name in SPLIT_ORDER:
+        if set(frame.loc[frame["split"].eq(split_name), "label"]) != {0, 1}:
+            raise PreprocessingError(f"Split does not contain both labels: {split_name}")
+    checks["每个split均包含两类邮件"] = "PASS"
+    return checks
+
+
+def _build_summary(
+    frame: pd.DataFrame,
+    config: dict[str, Any],
+    stats: dict[str, Any],
+    checks: dict[str, str],
+) -> str:
+    feature_order = [str(value) for value in config["feature_order"]]
+    lines = [
+        "# 最低限度预处理摘要",
+        "",
+        "## 输入与删减",
+        "",
+        f"- 输入文件：`{config['dataset']['path']}`",
+        f"- 原始记录：{stats['input_rows']}",
+        f"- 主题与正文同时为空而删除：{stats['blank_rows_removed']}",
+        f"- 精确重复组/涉及记录：{stats['exact_duplicate_groups']} / {stats['exact_duplicate_records']}",
+        f"- 删除的同标签精确重复：{stats['exact_duplicates_removed']}",
+        f"- 冲突标签重复组：{stats['conflicting_duplicate_groups']}",
+        f"- 最终记录：{stats['output_rows']}",
+        "",
+        "## 固定拆分及类别数量",
+        "",
+        "| split | legitimate (0) | phishing (1) | total | ratio |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for split_name in SPLIT_ORDER:
+        subset = frame.loc[frame["split"].eq(split_name)]
+        legitimate = int(subset["label"].eq(0).sum())
+        phishing = int(subset["label"].eq(1).sum())
+        lines.append(
+            f"| {split_name} | {legitimate} | {phishing} | {len(subset)} | {len(subset) / len(frame):.2%} |"
+        )
+
+    lines += [
+        "",
+        "## 8项特征范围",
+        "",
+        "| feature | min | max |",
+        "|---|---:|---:|",
+    ]
+    for column in feature_order:
+        lines.append(f"| {column} | {frame[column].min():.6g} | {frame[column].max():.6g} |")
+
+    lines += ["", "## 关键检查", "", "| check | result |", "|---|---|"]
+    lines.extend(f"| {name} | {status} |" for name, status in checks.items())
+    lines += [
+        "",
+        "## 已知问题",
+        "",
+        f"- 保留了 {stats['frozen_assignments_retained']} 个现有冻结 split 分配；对原映射未覆盖的 {stats['deterministic_assignments_added']} 封邮件按固定规则补充分配，没有重排既有记录。",
+        "- 为保留既有冻结映射，去重后的实际比例可能与70/15/15存在轻微取整偏差，具体比例见上表。",
+        "- 没有阻塞性未解决问题；测试集未用于关键词、特征、参数或阈值选择。",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def run(config_path: Path) -> dict[str, Any]:
+    root = _resolve_root(config_path)
+    config = load_yaml(config_path)
+    processed, stats = build_processed_frame(root, config)
+    feature_order = [str(value) for value in config["feature_order"]]
+    checks = _validate_output(processed, feature_order)
+
+    repeated, _ = build_processed_frame(root, config)
+    reproducibility_columns = ["email_id", "split", *feature_order]
+    if not processed[reproducibility_columns].equals(repeated[reproducibility_columns]):
+        raise PreprocessingError("Repeated run changed split or feature values")
+    checks["固定种子重复运行结果一致"] = "PASS"
+
+    output_path = root / str(config["output"]["processed_csv"])
+    summary_path = root / str(config["output"]["summary"])
+    write_csv_atomic(output_path, processed)
+    write_text_atomic(
+        summary_path,
+        _build_summary(processed, config, stats, checks),
+    )
+
+    split_counts = {
+        split_name: {
+            "legitimate": int(
+                processed.loc[processed["split"].eq(split_name), "label"].eq(0).sum()
+            ),
+            "phishing": int(
+                processed.loc[processed["split"].eq(split_name), "label"].eq(1).sum()
+            ),
+            "total": int(processed["split"].eq(split_name).sum()),
+        }
+        for split_name in SPLIT_ORDER
+    }
+    return {
+        "status": "PASS",
+        "output": str(output_path),
+        "summary": str(summary_path),
+        "rows": len(processed),
+        "split_counts": split_counts,
+        "checks": checks,
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Minimal phishing-email preprocessing")
+    parser.add_argument("--config", default="configs/pipeline.yaml")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    config_path = Path(args.config).resolve()
     try:
-        if args.stage == "validate-only":
-            result = run_validate_only(config_path)
-        else:
-            result = run_final(config_path, overwrite=bool(args.overwrite))
+        result = run(Path(args.config).resolve())
     except Exception as exc:
-        try:
-            failed_config = load_yaml(config_path)
-            failed_root = _resolve_root(config_path)
-            failed_log = failed_root / str(failed_config.get("log_path", "logs/pipeline.jsonl"))
-            JsonlLogger(failed_log, str(uuid.uuid4())).event(
-                "command",
-                "failed",
-                exit_code=1,
-                error_type=type(exc).__name__,
-                error_message=str(exc),
-            )
-        except Exception:
-            pass
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0

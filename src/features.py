@@ -11,21 +11,11 @@ import pandas as pd
 from src.sanitiser import URL_MARKER_RE
 
 
-FEATURE_ORDER = [
-    "url_count",
-    "ip_address_url_count",
-    "urgency_word_count",
-    "credential_word_count",
-    "action_word_count",
-    "money_related_word_count",
-    "uppercase_letter_ratio",
-    "exclamation_mark_count",
-]
 KEYWORD_CATEGORIES = ("urgency", "credential", "action", "money_related")
 
 
 class KeywordConfigError(ValueError):
-    """Raised when the frozen keyword contract is incomplete or mutable."""
+    """Raised when the frozen keyword definition is missing or mutable."""
 
 
 @lru_cache(maxsize=None)
@@ -40,16 +30,16 @@ class KeywordMatcher:
     config: dict[str, Any]
 
     def __post_init__(self) -> None:
-        status = self.config.get("keywords_status", self.config.get("status"))
-        version = self.config.get("keywords_version", self.config.get("version"))
-        if status != "frozen":
-            raise KeywordConfigError(f"Final feature extraction requires frozen status, found {status!r}")
-        if version != "1.0":
-            raise KeywordConfigError(f"Expected keyword version 1.0, found {version!r}")
+        if self.config.get("keywords_status") != "frozen":
+            raise KeywordConfigError("Keyword configuration must have frozen status")
+        if str(self.config.get("keywords_version")) != "1.0":
+            raise KeywordConfigError("Keyword configuration must be version 1.0")
         for category in KEYWORD_CATEGORIES:
             values = self.config.get(category)
-            if not isinstance(values, list) or not values or not all(isinstance(v, str) and v for v in values):
-                raise KeywordConfigError(f"Keyword category {category!r} must be a non-empty string list")
+            if not isinstance(values, list) or not values or not all(
+                isinstance(value, str) and value for value in values
+            ):
+                raise KeywordConfigError(f"Invalid keyword category: {category}")
 
     def normalise_variants(self, text: str) -> str:
         result = text.lower()
@@ -59,25 +49,22 @@ class KeywordMatcher:
         return result
 
     def count_category(self, text: str, category: str) -> int:
-        if category not in KEYWORD_CATEGORIES:
-            raise KeyError(category)
         working = self.normalise_variants(text)
         terms = sorted(
             self.config[category],
             key=lambda value: (-len(value.split()), -len(value), value),
         )
-        phrases = [term for term in terms if " " in term]
-        words = [term for term in terms if " " not in term]
         count = 0
-        for term in phrases + words:
-            pattern = _whole_term_pattern(term)
-            matches = list(pattern.finditer(working))
+        for term in [value for value in terms if " " in value] + [
+            value for value in terms if " " not in value
+        ]:
+            matches = list(_whole_term_pattern(term).finditer(working))
             count += len(matches)
             if matches:
-                chars = list(working)
+                characters = list(working)
                 for match in matches:
-                    chars[match.start() : match.end()] = " " * (match.end() - match.start())
-                working = "".join(chars)
+                    characters[match.start() : match.end()] = " " * (match.end() - match.start())
+                working = "".join(characters)
         return count
 
 
@@ -94,12 +81,9 @@ def _ip_url_count(text: str) -> int:
 
 
 def extract_features(subject: object, body: object, matcher: KeywordMatcher) -> dict[str, int | float]:
-    subject_text = "" if subject is None else str(subject)
-    body_text = "" if body is None else str(body)
-    text = f"{subject_text}\n{body_text}"
-    latin_letters = re.findall(r"[A-Za-z]", text)
-    uppercase = sum(1 for character in latin_letters if "A" <= character <= "Z")
-    ratio = uppercase / len(latin_letters) if latin_letters else 0.0
+    text = f"{'' if subject is None else subject}\n{'' if body is None else body}"
+    letters = re.findall(r"[A-Za-z]", text)
+    uppercase = sum("A" <= character <= "Z" for character in letters)
     markers = URL_MARKER_RE.findall(text)
     return {
         "url_count": len(markers),
@@ -108,24 +92,23 @@ def extract_features(subject: object, body: object, matcher: KeywordMatcher) -> 
         "credential_word_count": matcher.count_category(text, "credential"),
         "action_word_count": matcher.count_category(text, "action"),
         "money_related_word_count": matcher.count_category(text, "money_related"),
-        "uppercase_letter_ratio": ratio,
+        "uppercase_letter_ratio": uppercase / len(letters) if letters else 0.0,
         "exclamation_mark_count": text.count("!"),
     }
 
 
-def feature_frame(frame: pd.DataFrame, matcher: KeywordMatcher) -> pd.DataFrame:
+def feature_frame(
+    frame: pd.DataFrame,
+    matcher: KeywordMatcher,
+    feature_order: list[str],
+) -> pd.DataFrame:
     rows = [
         extract_features(subject, body, matcher)
         for subject, body in zip(
-            frame["sanitised_subject"], frame["sanitised_body"], strict=True
+            frame["sanitized_subject"], frame["sanitized_body"], strict=True
         )
     ]
     result = pd.DataFrame(rows, index=frame.index)
-    return result[FEATURE_ORDER]
-
-
-def model_matrix(frame: pd.DataFrame) -> pd.DataFrame:
-    missing = sorted(set(FEATURE_ORDER) - set(frame.columns))
-    if missing:
-        raise ValueError(f"Feature matrix is missing frozen columns: {missing}")
-    return frame.loc[:, FEATURE_ORDER].copy()
+    if len(feature_order) != 8 or set(feature_order) != set(result.columns):
+        raise ValueError("feature_order must contain exactly the frozen eight features")
+    return result[feature_order]

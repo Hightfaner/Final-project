@@ -1,4 +1,3 @@
-"""Frozen Week 6-7 phishing-email data pipeline."""
+"""Minimal preprocessing for the phishing-email project."""
 
-__version__ = "1.0.0"
-
+__version__ = "2.0.0"

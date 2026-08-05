@@ -10,16 +10,19 @@ from bs4 import BeautifulSoup
 
 
 URL_MARKER_RE = re.compile(r"\[URL:\s*([^\]\r\n]+)\]", re.IGNORECASE)
-RAW_URL_RE = re.compile(r"(?i)\b(?:https?://|ftp://|www\.)[^\s<>\"'\]]+")
+STATIC_MARKER_RE = re.compile(r"\[(?:URL|LINK):\s*[^\]\r\n]+\]", re.IGNORECASE)
+LEGACY_URL_WRAPPER_RE = re.compile(
+    r"(?i)<URL:\s*((?:https?://|www\.)[^>\s]+)\s*>"
+)
+RAW_LINK_RE = re.compile(
+    r"(?i)(?:(?:https?://|ftp://)[^\s<>\"'\]]+|(?<![A-Za-z0-9])www\.[^\s<>\"'\]]+)"
+)
 EMAIL_RE = re.compile(
-    r"(?<![A-Za-z0-9._%+\-])([A-Za-z0-9][A-Za-z0-9._%+\-]{0,63})@"
+    r"([A-Za-z0-9][A-Za-z0-9._%+\-]{0,63})@"
     r"([A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,63})\b"
 )
 PHONE_RE = re.compile(
     r"(?<!\w)(?:\+?\d{1,3}[ .\-]?)?(?:\(?\d{2,4}\)?[ .\-]?){2,4}\d{2,4}(?!\w)"
-)
-ATTACHMENT_RE = re.compile(
-    r"(?im)^\s*(?:content-disposition\s*:\s*attachment[^\r\n]*|attachment\s*:\s*[^\r\n]+)\s*$"
 )
 ACTIVE_TAGS = ("script", "style", "iframe", "object", "form")
 HTML_TAG_RE = re.compile(
@@ -31,24 +34,30 @@ HTML_TAG_RE = re.compile(
 @dataclass(frozen=True)
 class SanitisationResult:
     text: str
-    url_replacement_count: int
-    pii_replacement_count: int
-    removed_active_content_count: int
 
 
-def _decode_entities_fixed_point(value: str) -> str:
+def _decode_entities(value: str) -> str:
     current = value
     for _ in range(8):
         decoded = html.unescape(current)
         if decoded == current:
-            break
+            return current
         current = decoded
     return current
 
 
-def _normalise_url(value: str) -> str:
+def _redact_phone(match: re.Match[str]) -> str:
+    digits = re.sub(r"\D", "", match.group(0))
+    return "[PHONE]" if 7 <= len(digits) <= 15 else match.group(0)
+
+
+def _normalise_link_target(value: str) -> str:
     candidate = value.strip().rstrip(".,;:!?)}>")
-    parse_value = candidate if "://" in candidate else f"http://{candidate}"
+    parse_value = (
+        candidate
+        if re.match(r"(?i)^[a-z][a-z0-9+.-]*://", candidate)
+        else f"http://{candidate}"
+    )
     parsed = urlsplit(parse_value)
     host = (parsed.hostname or "unknown-host").lower()
     try:
@@ -56,122 +65,95 @@ def _normalise_url(value: str) -> str:
     except ValueError:
         pass
     path = re.sub(r"/{2,}", "/", parsed.path or "/")
-    safe = re.sub(r"[\x00-\x1f\x7f\[\]]", "", f"{host}{path}")
-    return safe[:240]
+    suffix = path + (f"?{parsed.query}" if parsed.query else "")
+    suffix = EMAIL_RE.sub(lambda match: f"[USER]@{match.group(2).lower()}", suffix)
+    suffix = PHONE_RE.sub(_redact_phone, suffix)
+    suffix = re.sub(
+        r"(?i)(https?|ftp)://",
+        lambda match: f"{match.group(1).lower()}-colon//",
+        suffix,
+    )
+    return re.sub(r"[\x00-\x1f\x7f\[\]]", "", f"{host}{suffix}")[:240]
 
 
-def _replace_raw_urls(text: str) -> tuple[str, int]:
-    count = 0
+def _is_http_link(value: str) -> bool:
+    lowered = value.strip().lower()
+    return lowered.startswith(("http://", "https://", "www."))
 
+
+def _replace_raw_links(text: str) -> str:
     def replace(match: re.Match[str]) -> str:
-        nonlocal count
         raw = match.group(0)
         trailing = ""
         while raw and raw[-1] in ".,;:!?)}>":
             trailing = raw[-1] + trailing
             raw = raw[:-1]
-        count += 1
-        return f"[URL: {_normalise_url(raw)}]{trailing}"
+        marker = "URL" if _is_http_link(raw) else "LINK"
+        return f"[{marker}: {_normalise_link_target(raw)}]{trailing}"
 
-    return RAW_URL_RE.sub(replace, text), count
+    return RAW_LINK_RE.sub(replace, text)
 
 
-def _html_to_text(value: str) -> tuple[str, int, int]:
+def _html_to_text(value: str) -> str:
     if not HTML_TAG_RE.search(value):
-        return value, 0, 0
+        return value
     soup = BeautifulSoup(value, "lxml")
-    removed = 0
-    url_count = 0
     for tag_name in ACTIVE_TAGS:
         for tag in soup.find_all(tag_name):
-            removed += 1
             tag.decompose()
     for tag in soup.find_all("img"):
-        source = str(tag.get("src") or "")
-        if source:
-            tag.replace_with(" [REMOTE IMAGE REMOVED] ")
-        else:
-            tag.decompose()
-        removed += 1
+        tag.replace_with(" [REMOTE IMAGE REMOVED] ")
     for tag in soup.find_all("a"):
         href = str(tag.get("href") or "")
         anchor_text = tag.get_text(" ", strip=True)
-        if re.match(r"(?i)^(?:https?://|ftp://|www\.)", href):
-            marker = f"[URL: {_normalise_url(href)}]"
-            tag.replace_with(f"{anchor_text} {marker}".strip())
-            url_count += 1
+        if re.match(r"(?i)^(?:https?://|www\.)", href):
+            target = f"[URL: {_normalise_link_target(href)}]"
+            tag.replace_with(f"{anchor_text} {target}".strip())
+        elif re.match(r"(?i)^ftp://", href):
+            target = f"[LINK: {_normalise_link_target(href)}]"
+            tag.replace_with(f"{anchor_text} {target}".strip())
         else:
             tag.replace_with(anchor_text)
     for tag_name in ("link", "source", "video", "audio", "embed"):
         for tag in soup.find_all(tag_name):
-            removed += 1
             tag.decompose()
-    return soup.get_text("\n"), url_count, removed
+    return soup.get_text("\n")
 
 
 def _normalise_whitespace(value: str) -> str:
     value = value.replace("\r\n", "\n").replace("\r", "\n")
     lines = [re.sub(r"[\t\f\v ]+", " ", line).strip() for line in value.split("\n")]
-    value = "\n".join(lines)
-    value = re.sub(r"\n{3,}", "\n\n", value)
-    return value.strip()
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
 
 def sanitise_text(value: object) -> SanitisationResult:
     source = "" if value is None else str(value)
-    source = _decode_entities_fixed_point(source)
-    text, html_url_count, removed_count = _html_to_text(source)
+    text = _html_to_text(_decode_entities(source))
+    text = LEGACY_URL_WRAPPER_RE.sub(
+        lambda match: f"[URL: {_normalise_link_target(match.group(1))}]", text
+    )
 
-    attachment_count = len(ATTACHMENT_RE.findall(text))
-    if attachment_count:
-        text = ATTACHMENT_RE.sub("[ATTACHMENT REMOVED]", text)
-
-    protected_markers: list[str] = []
+    markers: list[str] = []
 
     def protect_marker(match: re.Match[str]) -> str:
-        token = f"__STATIC_URL_MARKER_{len(protected_markers)}__"
-        protected_markers.append(match.group(0))
+        token = f"__STATIC_LINK_MARKER_{len(markers)}__"
+        markers.append(match.group(0))
         return token
 
-    text = URL_MARKER_RE.sub(protect_marker, text)
-    text, raw_url_count = _replace_raw_urls(text)
-    for index, marker in enumerate(protected_markers):
-        text = text.replace(f"__STATIC_URL_MARKER_{index}__", marker)
+    # Protect markers already produced by an earlier run before looking for
+    # raw links, then protect the new markers before PII replacement.
+    text = STATIC_MARKER_RE.sub(protect_marker, text)
+    text = _replace_raw_links(text)
+    text = STATIC_MARKER_RE.sub(protect_marker, text)
     text = _normalise_whitespace(text)
-    pii_count = 0
-
-    def replace_email(match: re.Match[str]) -> str:
-        nonlocal pii_count
-        pii_count += 1
-        return f"[USER]@{match.group(2).lower()}"
-
-    text = EMAIL_RE.sub(replace_email, text)
-
-    def replace_phone(match: re.Match[str]) -> str:
-        nonlocal pii_count
-        candidate = match.group(0)
-        digits = re.sub(r"\D", "", candidate)
-        if not 7 <= len(digits) <= 15:
-            return candidate
-        pii_count += 1
-        return "[PHONE]"
-
-    for _ in range(8):
-        updated = PHONE_RE.sub(replace_phone, text)
+    text = EMAIL_RE.sub(lambda match: f"[USER]@{match.group(2).lower()}", text)
+    for _ in range(64):
+        updated = PHONE_RE.sub(_redact_phone, text)
         if updated == text:
             break
         text = updated
-    text = _normalise_whitespace(text)
-    return SanitisationResult(
-        text=text,
-        url_replacement_count=html_url_count + raw_url_count,
-        pii_replacement_count=pii_count,
-        removed_active_content_count=removed_count + attachment_count,
-    )
-
-
-def meaningful_body(text: str) -> bool:
-    # The frozen exclusion rule is "completely missing or blank body". Do not
-    # impose an ASCII-language or semantic-content test: non-Latin text,
-    # punctuation-only source records, and safe evidence markers are not blank.
-    return bool(text.strip())
+    else:
+        raise ValueError("Phone redaction did not reach a fixed point")
+    for index, marker in enumerate(markers):
+        text = text.replace(f"__STATIC_LINK_MARKER_{index}__", marker)
+    return SanitisationResult(text=_normalise_whitespace(text))
