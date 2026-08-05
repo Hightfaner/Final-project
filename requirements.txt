@@ -1,7 +1,9 @@
 beautifulsoup4>=4.12,<5
 lxml>=5.0,<7
+kmedoids>=0.5.5,<0.6
 pandas>=2.2,<4
 PyYAML>=6.0,<7
 pytest>=8.0,<10
 scikit-learn>=1.5,<2
+shap>=0.48,<1
 xgboost>=2.1,<4
